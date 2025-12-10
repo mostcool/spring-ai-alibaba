@@ -11,3 +11,5 @@
 **/src/test/resources/*.pdf
 **/src/main/resources/static/**
 **/pnpm-lock.yaml
+**/package-lock.json
+**/spring-ai-alibaba-studio/**
