@@ -8,7 +8,7 @@ Since its open-source inception, Spring AI Alibaba has received attention from m
 
 We sincerely thank the developers who have submitted Issues and PRs for this project. We hope more community developers will join us to make this project even better.
 
-## How to Contribute
+## Contribution Process
 
 Before contributing code, please take a moment to understand the process of contributing to Spring AI Alibaba.
 
@@ -38,18 +38,14 @@ If you are a first-time contributor, you can claim a relatively simple task from
 
 After forking the repository, new commits may have appeared in the original repository's main branch. To avoid conflicts between your PR and the commits in the main branch, you need to regularly merge from the main branch.
 
-- In your local spring-ai-alibaba directory, execute `git remote add upstream https://github.com/alibaba/spring-ai-alibaba` to add the original repository address to the remote stream.
-- In your local spring-ai-alibaba directory, execute `git fetch upstream` to fetch the remote stream to your local machine.
-- In your local spring-ai-alibaba directory, execute `git checkout main` to switch to the master branch.
+- In your local spring-ai-alibaba directory, execute `git remote add upstream https://github.com/alibaba/spring-ai-alibaba` to add the original repository address as the remote upstream.
+- In your local spring-ai-alibaba directory, execute `git fetch upstream` to fetch the remote updates to your local machine.
+- In your local spring-ai-alibaba directory, execute `git checkout main` to switch to the main branch.
 - In your local spring-ai-alibaba directory, execute `git rebase upstream/main` to rebase the latest code.
 
 ### Configure Spring AI Standard Code Format
 
 As one of the implementations of Spring AI, Spring AI Alibaba directly follows the Spring AI project's code standards. Before you start, please refer to the relevant code format specification instructions. You need to configure the code format standards properly before submitting your code.
-
-### Develop
-
-Develop your feature, and **after development, we recommend using the `mvn clean package` command to ensure that the modified code can be compiled locally. This command will also automatically format the code in the Spring way**. Then commit your code. Before committing, please create a new branch related to this feature and use this branch for code submission.
 
 ### Development
 
@@ -57,7 +53,7 @@ Develop your feature, and **after completing development, it's recommended to us
 
 ### Local CI
 
-After completing development in your local BOE environment, it's strongly recommended to run the provided `make` command in the project's `tools/make` directory to perform local Continuous Integration (CI) checks. This ensures your code adheres to the project's standards and guidelines. If you have questions about local CI, you can enter `make help` in the console for more detailed information.
+After completing development in your local environment, it's strongly recommended to run the provided `make` command in the project's `tools/make` directory to perform local Continuous Integration (CI) checks. This ensures your code adheres to the project's standards and guidelines. If you have questions about local CI, you can enter `make help` in the console for more detailed information.
 
 ### Local Checkstyle
 

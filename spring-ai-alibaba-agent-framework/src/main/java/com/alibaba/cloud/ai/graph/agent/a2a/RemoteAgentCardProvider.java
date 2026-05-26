@@ -1,5 +1,5 @@
 /*
- * Copyright 2024-2025 the original author or authors.
+ * Copyright 2024-2026 the original author or authors.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -52,7 +52,7 @@ public class RemoteAgentCardProvider implements AgentCardProvider {
 			AgentCard finalAgentCard;
 			AgentCard publicAgentCard = A2A.getAgentCard(this.url);
 			finalAgentCard = publicAgentCard;
-			if (publicAgentCard.supportsAuthenticatedExtendedCard()) {
+			if (Boolean.TRUE.equals(publicAgentCard.supportsAuthenticatedExtendedCard())) {
 				Map<String, String> authHeaders = new HashMap<>();
 				authHeaders.put("Authorization", "Bearer dummy-token-for-extended-card");
 				finalAgentCard = A2A.getAgentCard(this.url, "/agent/authenticatedExtendedCard", authHeaders);

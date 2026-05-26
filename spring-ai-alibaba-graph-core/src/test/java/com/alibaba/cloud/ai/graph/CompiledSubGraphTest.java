@@ -1,5 +1,5 @@
 /*
- * Copyright 2024-2025 the original author or authors.
+ * Copyright 2024-2026 the original author or authors.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -16,6 +16,7 @@
 package com.alibaba.cloud.ai.graph;
 
 import com.alibaba.cloud.ai.graph.action.AsyncNodeAction;
+import com.alibaba.cloud.ai.graph.action.AsyncNodeActionWithConfig;
 import com.alibaba.cloud.ai.graph.checkpoint.BaseCheckpointSaver;
 import com.alibaba.cloud.ai.graph.checkpoint.config.SaverConfig;
 import com.alibaba.cloud.ai.graph.checkpoint.savers.MemorySaver;
@@ -68,9 +69,7 @@ public class CompiledSubGraphTest {
 		return node_async(state -> {
 			RunnableConfig resumeConfig = null;
 			if (state.value("resume_subgraph", Boolean.class).orElse(false)) {
-				resumeConfig = RunnableConfig.builder(runnableConfig)
-						.addMetadata(RunnableConfig.HUMAN_FEEDBACK_METADATA_KEY, "placeholder")
-						.build();
+				resumeConfig = runnableConfig.withResume();
 			}
 
 			var output = subGraph.streamFromInitialNode(state, resumeConfig != null ? resumeConfig : runnableConfig)
@@ -103,6 +102,37 @@ public class CompiledSubGraphTest {
 			.addEdge("NODE3.3", "NODE3.4")
 			.addEdge("NODE3.4", END)
 			.compile(compileConfig);
+	}
+
+	@Test
+	public void testCompiledSubgraphReceivesParentContext() throws Exception {
+		var subGraph = new StateGraph(getStrategyFactory())
+			.addNode("child", AsyncNodeActionWithConfig.node_async((state, config) -> {
+				config.context().put("child-only", "should-not-leak");
+				return Map.of("messages", "child:" + config.context().get("request-id"));
+			}))
+			.addEdge(START, "child")
+			.addEdge("child", END)
+			.compile();
+
+		var parentGraph = new StateGraph(getStrategyFactory())
+			.addNode("parent", AsyncNodeActionWithConfig.node_async((state, config) -> {
+				config.context().put("request-id", "context-value");
+				return Map.of("messages", "parent");
+			}))
+			.addNode("subgraph", subGraph)
+			.addNode("after", AsyncNodeActionWithConfig.node_async((state, config) -> Map.of("messages",
+					"after:" + config.context().containsKey("child-only"))))
+			.addEdge(START, "parent")
+			.addEdge("parent", "subgraph")
+			.addEdge("subgraph", "after")
+			.addEdge("after", END)
+			.compile();
+
+		var output = parentGraph.invoke(Map.of(), RunnableConfig.builder().build()).orElseThrow();
+
+		assertIterableEquals(List.of("parent", "child:context-value", "after:false"),
+				output.value("messages", List.class).orElseThrow());
 	}
 
 	@Test
@@ -168,9 +198,7 @@ public class CompiledSubGraphTest {
 					// RESUME
 					var nodeBeforeSubgraph = "NODE2";
 					runnableConfig = parentGraph.updateState(runnableConfig, interruptionState, nodeBeforeSubgraph);
-					resumeConfig = RunnableConfig.builder(runnableConfig)
-							.addMetadata(RunnableConfig.HUMAN_FEEDBACK_METADATA_KEY, "placeholder")
-							.build();
+					resumeConfig = runnableConfig.withResume();
 					input = null;
 
 					System.out.println("RESUME GRAPH FROM END OF NODE: " + nodeBeforeSubgraph);
@@ -229,9 +257,7 @@ public class CompiledSubGraphTest {
 
 		input = null;
 
-		RunnableConfig resumeConfig = RunnableConfig.builder(runnableConfig)
-				.addMetadata(RunnableConfig.HUMAN_FEEDBACK_METADATA_KEY, "placeholder")
-				.build();
+		RunnableConfig resumeConfig = runnableConfig.withResume();
 
 		results = parentGraph.stream(input, resumeConfig).collectList().block();
 		output = results.stream().peek(out -> System.out.println("output: " + out)).reduce((a, b) -> b);
@@ -290,9 +316,7 @@ public class CompiledSubGraphTest {
 
 		input = null;
 
-		RunnableConfig resumeConfig = RunnableConfig.builder(runnableConfig)
-				.addMetadata(RunnableConfig.HUMAN_FEEDBACK_METADATA_KEY, "placeholder")
-				.build();
+		RunnableConfig resumeConfig = runnableConfig.withResume();
 		results = parentGraph.stream(input, resumeConfig).collectList().block();
 		output = results.stream().peek(out -> System.out.println("output: " + out)).reduce((a, b) -> b);
 

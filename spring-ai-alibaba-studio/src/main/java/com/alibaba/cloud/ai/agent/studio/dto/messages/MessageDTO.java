@@ -1,5 +1,5 @@
 /*
- * Copyright 2024-2025 the original author or authors.
+ * Copyright 2024-2026 the original author or authors.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -16,6 +16,7 @@
 package com.alibaba.cloud.ai.agent.studio.dto.messages;
 
 import com.alibaba.cloud.ai.graph.action.InterruptionMetadata;
+import com.alibaba.cloud.ai.graph.serializer.AgentInstructionMessage;
 
 import org.springframework.ai.chat.messages.AssistantMessage;
 import org.springframework.ai.chat.messages.Message;
@@ -63,6 +64,13 @@ public interface MessageDTO {
 		 */
 		public static MessageDTO fromMessage(Message message) {
 			if (message == null) {
+				return null;
+			}
+
+			// AgentInstructionMessage carries an agent's instruction (a system-prompt-like
+			// directive injected by InstructionAgentHook). It's intended for the LLM, not
+			// the UI, so we hide it from the rendered transcript by returning null here.
+			if (message instanceof AgentInstructionMessage) {
 				return null;
 			}
 

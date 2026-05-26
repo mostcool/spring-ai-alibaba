@@ -1,5 +1,5 @@
 /*
- * Copyright 2024-2025 the original author or authors.
+ * Copyright 2024-2026 the original author or authors.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -13,11 +13,13 @@
  * See the License for the specific language governing permissions and
  * limitations under the License.
  */
+
 package com.alibaba.cloud.ai.graph.executor;
 
 import com.alibaba.cloud.ai.graph.GraphResponse;
 import com.alibaba.cloud.ai.graph.GraphRunnerContext;
 import com.alibaba.cloud.ai.graph.NodeOutput;
+import com.alibaba.cloud.ai.graph.OverAllState;
 import com.alibaba.cloud.ai.graph.RunnableConfig;
 import com.alibaba.cloud.ai.graph.action.AsyncNodeActionWithConfig;
 import com.alibaba.cloud.ai.graph.action.Command;
@@ -32,6 +34,7 @@ import java.util.ArrayList;
 import java.util.LinkedHashMap;
 import org.springframework.ai.chat.messages.AssistantMessage;
 import org.springframework.ai.chat.messages.AssistantMessage.ToolCall;
+import org.springframework.ai.chat.messages.Message;
 import org.springframework.ai.chat.model.ChatResponse;
 import org.springframework.ai.chat.model.Generation;
 
@@ -56,7 +59,6 @@ import java.util.stream.Collectors;
 import static com.alibaba.cloud.ai.graph.GraphRunnerContext.INTERRUPT_AFTER;
 import static com.alibaba.cloud.ai.graph.StateGraph.*;
 import static com.alibaba.cloud.ai.graph.internal.node.ParallelNode.getExecutor;
-import static java.util.Objects.requireNonNull;
 
 /**
  * Node executor that processes node execution and result handling. This class
@@ -165,6 +167,29 @@ public class NodeExecutor extends BaseGraphExecutor {
 				return handleGraphFlux(context, embedGraphFlux.get(), updateState, resultValue);
 			}
 
+			// Check for interruptAfter hook (after apply() but before state merge)
+			String currentNodeId = context.getCurrentNodeId();
+			AsyncNodeActionWithConfig action = context.getNodeAction(currentNodeId);
+			if (action instanceof InterruptableAction) {
+				Optional<InterruptionMetadata> interruptMetadata = ((InterruptableAction) action)
+					.interruptAfter(currentNodeId, context.cloneState(context.getCurrentStateData()),
+						updateState, context.getConfig());
+				if (interruptMetadata.isPresent()) {
+					// Merge state first to ensure correct state on resume
+					context.mergeIntoCurrentState(updateState);
+					// Determine next node before creating checkpoint
+					Command nextCommand = context.nextNodeId(currentNodeId, context.getCurrentStateData());
+					context.setNextNodeId(nextCommand.gotoNode());
+					// Build checkpoint with correct nextNodeId
+					context.buildNodeOutputAndAddCheckpoint(updateState);
+					// Call NODE_AFTER listeners
+					context.doListeners(NODE_AFTER, null);
+					// Return interruption
+					resultValue.set(interruptMetadata.get());
+					return Flux.just(GraphResponse.done(interruptMetadata.get()));
+				}
+			}
+
 			context.mergeIntoCurrentState(updateState);
 
 			if (context.getCompiledGraph().compileConfig.interruptBeforeEdge()
@@ -203,10 +228,6 @@ public class NodeExecutor extends BaseGraphExecutor {
 		var lastGraphResponseRef = new AtomicReference<GraphResponse<NodeOutput>>(null);
 
 		return rawFlux.filter(element -> {
-				// skip ChatResponse.getResult() == null
-				if (element instanceof ChatResponse response) {
-					return response.getResult() != null &&  response.getResult().getOutput() != null;
-				}
 				// Don't filter out Exception/Throwable - we need to handle them
 				return true;
 			})
@@ -222,22 +243,36 @@ public class NodeExecutor extends BaseGraphExecutor {
 					return errorResponse;
 				}
 				if (element instanceof ChatResponse response) {
+					// Handle usage-only chunks (null result/output) without dropping usage metadata
+					if (response.getResult() == null || response.getResult().getOutput() == null) {
+						GraphResponse<NodeOutput> graphResponse = GraphResponse
+							.of(context.buildStreamingOutput(response, nodeId, true));
+						lastGraphResponseRef.set(graphResponse);
+						return graphResponse;
+					}
 					ChatResponse lastResponse = lastChatResponseRef.get();
 					final var currentMessage = response.getResult().getOutput();
 
 					if (lastResponse == null) {
 						lastChatResponseRef.set(response);
 					} else {
-						final var lastMessageText = requireNonNull(lastResponse.getResult().getOutput().getText(),
-								"lastResponse text cannot be null");
+						var lastOutput = lastResponse.getResult().getOutput();
+						var lastMessageText = "";
+						if (lastOutput.getText() != null) {
+							lastMessageText = lastOutput.getText();
+						}
 
 						final var currentMessageText = currentMessage.getText();
 
+						boolean mergeReasoningContent = context.getConfig().mergeReasoningContent();
+						Map<String, Object> messageMetadata = mergeReasoningContent
+								? mergeMetadataWithReasoningContent(lastOutput.getMetadata(), currentMessage.getMetadata())
+								: currentMessage.getMetadata();
+
 						var newMessage = AssistantMessage.builder()
 								.content(currentMessageText != null ? lastMessageText.concat(currentMessageText) : lastMessageText)
-								.properties(currentMessage.getMetadata())
-								.toolCalls(mergeToolCalls(lastResponse.getResult().getOutput().getToolCalls(),
-										currentMessage.getToolCalls()))
+								.properties(messageMetadata)
+								.toolCalls(mergeToolCalls(lastOutput.getToolCalls(), currentMessage.getToolCalls()))
 								.media(currentMessage.getMedia())
 								.build();
 
@@ -249,7 +284,7 @@ public class NodeExecutor extends BaseGraphExecutor {
 						lastChatResponseRef.set(newResponse);
 					}
 					GraphResponse<NodeOutput> lastGraphResponse = GraphResponse
-						.of(context.buildStreamingOutput(response.getResult().getOutput(), response, nodeId));
+						.of(context.buildStreamingOutput(response.getResult().getOutput(), response, nodeId, true));
 					 lastGraphResponseRef.set(lastGraphResponse);
 					return lastGraphResponse;
 				}
@@ -266,7 +301,7 @@ public class NodeExecutor extends BaseGraphExecutor {
 					try {
 						log.info("Received element of type '{}' in embedded Flux for key '{}', wrapping in StreamingOutput.",
 							element.getClass().getName(), key);
-						StreamingOutput<?> streamingOutput = context.buildStreamingOutput(element, nodeId);
+						StreamingOutput<?> streamingOutput = context.buildStreamingOutput(element, nodeId, true);
 						GraphResponse<NodeOutput> graphResponse = GraphResponse.of(streamingOutput);
 						lastGraphResponseRef.set(graphResponse);
 						return graphResponse;
@@ -284,15 +319,15 @@ public class NodeExecutor extends BaseGraphExecutor {
 				lastGraphResponseRef.set(errorResponse);
 				return Flux.just(errorResponse);
 			})
-			.concatWith(Mono.defer(() -> {
+			.concatWith(Flux.defer(() -> {
 				if (lastChatResponseRef.get() == null) {
-					GraphResponse<?> lastGraphResponse = lastGraphResponseRef.get();
+					GraphResponse<NodeOutput> lastGraphResponse = lastGraphResponseRef.get();
 					if (lastGraphResponse != null && lastGraphResponse.resultValue().isPresent()) {
 						Object result = lastGraphResponse.resultValue().get();
 
 						// don't re-emit InterruptionMetadata, it will be handled by MainGraphExecutor
 						if (result instanceof InterruptionMetadata) {
-							return Mono.empty();
+							return Flux.empty();
 						}
 
 						if (result instanceof Map resultMap) {
@@ -304,54 +339,172 @@ public class NodeExecutor extends BaseGraphExecutor {
 								}
 							}
 						}
-						return Mono.just(lastGraphResponseRef.get());
+						return Flux.just(lastGraphResponse);
 					}
-					return Mono.empty();
+					return Flux.empty();
 				} else {
-					return Mono.fromCallable(() -> {
-						Map<String, Object> completionResult = new HashMap<>();
-						completionResult.put(key, lastChatResponseRef.get().getResult().getOutput());
-						if (!key.equals("messages")) {
-							completionResult.put("messages", lastChatResponseRef.get().getResult().getOutput());
-						}
-						return GraphResponse.done(completionResult);
-					});
+					ChatResponse lastChatResponse = lastChatResponseRef.get();
+					// FINISHED StreamingOutput omits message for agent/graph LLM nodes (tool/hook unchanged); full text still in done(state).
+					Message messageForCompletion = lastChatResponse.getResult().getOutput();
+					if (shouldOmitMessageOnStreamCompletion(nodeId)) {
+						messageForCompletion = null;
+					}
+					GraphResponse<NodeOutput> aggregatedResponse = GraphResponse
+						.of(context.buildStreamingOutput(messageForCompletion, lastChatResponse, nodeId, false));
+					// Then emit the completion response
+					Map<String, Object> completionResult = new HashMap<>();
+					completionResult.put(key, lastChatResponse.getResult().getOutput());
+					if (!key.equals("messages")) {
+						completionResult.put("messages", lastChatResponse.getResult().getOutput());
+					}
+					GraphResponse<NodeOutput> doneResponse = GraphResponse.done(completionResult);
+					return Flux.just(aggregatedResponse, doneResponse);
 				}
 			}));
 	}
 
-  /**
-   * Merges tool calls from two messages.
-   * Tool calls with the same id will be merged.
-   *
-   * @return the merged list of tool calls
-   */
-  private List<ToolCall> mergeToolCalls(List<ToolCall> lastToolCalls, List<ToolCall> currentToolCalls) {
+	/**
+	 * Merges metadata from last and current streaming chunks, aggregating
+	 * {@code reasoningContent} by concatenation (each chunk carries partial content).
+	 * Other metadata keys are taken from current; fallback to last when absent.
+	 */
+	private static Map<String, Object> mergeMetadataWithReasoningContent(
+			Map<String, Object> lastMetadata, Map<String, Object> currentMetadata) {
+		Map<String, Object> merged = new LinkedHashMap<>();
+		if (lastMetadata != null) {
+			merged.putAll(lastMetadata);
+		}
+		if (currentMetadata != null) {
+			merged.putAll(currentMetadata);
+		}
+		// Aggregate reasoningContent: concatenate last + current (streaming chunks are incremental)
+		String key = "reasoningContent";
+		String last = (lastMetadata != null && lastMetadata.containsKey(key))
+				? String.valueOf(lastMetadata.get(key)) : "";
+		String current = (currentMetadata != null && currentMetadata.containsKey(key))
+				? String.valueOf(currentMetadata.get(key)) : "";
+		if (!last.isEmpty() || !current.isEmpty()) {
+			String aggregated = last.isEmpty() ? current : (current.isEmpty() ? last : last + current);
+			merged.put(key, aggregated);
+		}
+		return merged;
+	}
 
-	  if (lastToolCalls == null || lastToolCalls.isEmpty()) {
-		  return currentToolCalls != null ? currentToolCalls : List.of();
-	  }
-	  if (currentToolCalls == null || currentToolCalls.isEmpty()) {
-		  return lastToolCalls;
-	  }
+    /**
+     * Merges tool calls from two streamed assistant messages.
+     * <p>
+     * Streaming chunks from some providers may split tool-call fields across multiple chunks
+     * (for example: first chunk has name, later chunk has only arguments and even no id).
+     * We merge by id when possible, and fall back to positional merge to keep a single
+     * tool call record complete.
+     *
+     * @return the merged list of tool calls
+     */
+    private List<ToolCall> mergeToolCalls(List<ToolCall> lastToolCalls, List<ToolCall> currentToolCalls) {
+        if (lastToolCalls == null || lastToolCalls.isEmpty()) {
+            return currentToolCalls != null ? currentToolCalls : List.of();
+        }
+        if (currentToolCalls == null || currentToolCalls.isEmpty()) {
+            return lastToolCalls;
+        }
 
+        List<ToolCall> merged = new ArrayList<>(lastToolCalls);
+        for (int i = 0; i < currentToolCalls.size(); i++) {
+            ToolCall current = currentToolCalls.get(i);
+            if (current == null) {
+                continue;
+            }
+            int mergeIndex = findToolCallMergeIndex(merged, current, i);
+            if (mergeIndex >= 0) {
+                merged.set(mergeIndex, mergeToolCallFields(merged.get(mergeIndex), current));
+            }
+            else {
+                merged.add(current);
+            }
+        }
+        return merged;
+    }
 
-	  Map<String, ToolCall> toolCallMap = new LinkedHashMap<>();
+    private int findToolCallMergeIndex(List<ToolCall> mergedCalls, ToolCall currentToolCall, int currentIndex) {
+        String currentId = normalized(currentToolCall.id());
+        if (StringUtils.hasText(currentId)) {
+            for (int i = 0; i < mergedCalls.size(); i++) {
+                if (currentId.equals(normalized(mergedCalls.get(i).id()))) {
+                    return i;
+                }
+            }
+        }
 
-	  List<AssistantMessage.ToolCall> resultCalls = new ArrayList<>();
-	  currentToolCalls.forEach(tc -> toolCallMap.put(tc.id(), tc));
+        if (currentIndex < mergedCalls.size()) {
+            return currentIndex;
+        }
 
-	  // remove duplicate while keep order
-	  lastToolCalls.forEach(tc->{
-		  if( !toolCallMap.containsKey(tc.id()) ) {
-			  resultCalls.add(tc);
-		  }
-	  });
+        String currentName = normalized(currentToolCall.name());
+        if (StringUtils.hasText(currentName)) {
+            int matchedIndex = -1;
+            for (int i = 0; i < mergedCalls.size(); i++) {
+                if (currentName.equals(normalized(mergedCalls.get(i).name()))) {
+                    if (matchedIndex >= 0) {
+                        return -1;
+                    }
+                    matchedIndex = i;
+                }
+            }
+            if (matchedIndex >= 0) {
+                return matchedIndex;
+            }
+        }
 
-	  resultCalls.addAll(currentToolCalls);
+        return -1;
+    }
 
-	  return resultCalls;
-  }
+    private ToolCall mergeToolCallFields(ToolCall previous, ToolCall current) {
+        return new AssistantMessage.ToolCall(
+                firstNonBlank(current.id(), previous.id()),
+                firstNonBlank(current.type(), previous.type()),
+                firstNonBlank(current.name(), previous.name()),
+                mergeToolArguments(previous.arguments(), current.arguments()));
+    }
+
+    private static String mergeToolArguments(String previousArguments, String currentArguments) {
+        if (!StringUtils.hasText(previousArguments)) {
+            return currentArguments;
+        }
+        if (!StringUtils.hasText(currentArguments)) {
+            return previousArguments;
+        }
+
+        if (currentArguments.equals(previousArguments)) {
+            return currentArguments;
+        }
+        if (currentArguments.startsWith(previousArguments) || currentArguments.contains(previousArguments)) {
+            return currentArguments;
+        }
+        if (previousArguments.startsWith(currentArguments) || previousArguments.contains(currentArguments)) {
+            return previousArguments;
+        }
+
+        // Typical streaming delta case: append incremental argument fragment.
+        return previousArguments + currentArguments;
+    }
+
+    private static String firstNonBlank(String primary, String fallback) {
+        return StringUtils.hasText(primary) ? primary : fallback;
+    }
+
+    private static String normalized(String value) {
+        return StringUtils.hasText(value) ? value : null;
+    }
+
+	/**
+	 * Whether the FINISHED {@link StreamingOutput} after a {@link ChatResponse} flux should omit
+	 * {@link Message} text (agent model and ordinary graph LLM nodes). Tool/hook streams keep the message.
+	 */
+	private static boolean shouldOmitMessageOnStreamCompletion(String nodeId) {
+		return nodeId.startsWith(RunnableConfig.AGENT_MODEL_NAME)
+				|| (!nodeId.startsWith(RunnableConfig.AGENT_TOOL_NAME)
+						&& !nodeId.startsWith(RunnableConfig.AGENT_HOOK_NAME_PREFIX));
+	}
 
 	/**
 	 * Processes a Flux<GraphResponse<NodeOutput>> with embedded flux handling logic.
@@ -410,19 +563,23 @@ public class NodeExecutor extends BaseGraphExecutor {
 							&& !(e.getValue() instanceof ParallelGraphFlux))
 					.collect(Collectors.toMap(Map.Entry::getKey, Map.Entry::getValue));
 
-			context.mergeIntoCurrentState(partialStateWithoutFlux);
-
 			Map<String, Object> updateState = new HashMap<>();
 			if (nodeResultValue.isPresent()) {
 				Object value = nodeResultValue.get();
 				if (value instanceof Map<?, ?>) {
 					updateState = (Map<String, Object>) value;
-					context.mergeIntoCurrentState(updateState);
 				}
 				else {
 					throw new IllegalArgumentException("Node stream must return Map result using Data.done(),");
 				}
 			}
+
+			Map<String, Object> combinedUpdateState = new HashMap<>(partialStateWithoutFlux);
+			combinedUpdateState.putAll(updateState);
+			Optional<InterruptionMetadata> interruptAfterMetadata = interruptAfterForStreaming(context, combinedUpdateState);
+
+			context.mergeIntoCurrentState(partialStateWithoutFlux);
+			context.mergeIntoCurrentState(updateState);
 
 			try {
 				Command nextCommand = context.nextNodeId(context.getCurrentNodeId(), context.getCurrentStateData());
@@ -431,6 +588,7 @@ public class NodeExecutor extends BaseGraphExecutor {
 				context.buildNodeOutputAndAddCheckpoint(updateState);
 
 				context.doListeners(NODE_AFTER, null);
+				interruptAfterMetadata.ifPresent(context::setReturnFromEmbedWithValue);
 			}
 			catch (Exception e) {
 				throw new RuntimeException(e);
@@ -572,15 +730,18 @@ public class NodeExecutor extends BaseGraphExecutor {
 				return;
 			}
 
-			// Apply mapResult function if available
-			Map<String, Object> resultMap = new HashMap<>();
-			resultMap.put(graphFlux.getKey(), lastData);
+			// Resolve the final GraphFlux result into a graph state update.
+			Map<String, Object> resultMap = graphFluxResultState(graphFlux, lastData);
 
 			// Merge non-GraphFlux state
 			Map<String, Object> partialStateWithoutGraphFlux = partialState.entrySet()
 					.stream()
 					.filter(e -> !(e.getValue() instanceof GraphFlux))
 					.collect(Collectors.toMap(Map.Entry::getKey, Map.Entry::getValue));
+
+			Map<String, Object> combinedUpdateState = new HashMap<>(partialStateWithoutGraphFlux);
+			combinedUpdateState.putAll(resultMap);
+			Optional<InterruptionMetadata> interruptAfterMetadata = interruptAfterForStreaming(context, combinedUpdateState);
 
 			context.mergeIntoCurrentState(partialStateWithoutGraphFlux);
 
@@ -596,6 +757,7 @@ public class NodeExecutor extends BaseGraphExecutor {
 				context.buildNodeOutputAndAddCheckpoint(partialStateWithoutGraphFlux);
 
 				context.doListeners(NODE_AFTER, null);
+				interruptAfterMetadata.ifPresent(context::setReturnFromEmbedWithValue);
 			} catch (Exception e) {
 				throw new RuntimeException(e);
 			}
@@ -603,6 +765,67 @@ public class NodeExecutor extends BaseGraphExecutor {
 
 		return processedFlux
 				.concatWith(updateContextMono.thenMany(Flux.defer(() -> mainGraphExecutor.execute(context, resultValue))));
+	}
+
+	private Map<String, Object> graphFluxResultState(GraphFlux<?> graphFlux, Object lastData) {
+		if (lastData instanceof GraphResponse<?> graphResponse) {
+			Optional<Object> resultValue = graphResponse.resultValue();
+			if (resultValue.isPresent()) {
+				Object value = resultValue.get();
+				if (value instanceof Map<?, ?> resultMap) {
+					return copyStateMap(resultMap);
+				}
+			}
+		}
+
+		Map<String, Object> state = new HashMap<>();
+		state.put(graphFluxStateKey(graphFlux), lastData);
+		return state;
+	}
+
+	private static String graphFluxStateKey(GraphFlux<?> graphFlux) {
+		return StringUtils.hasText(graphFlux.getKey()) ? graphFlux.getKey() : "result";
+	}
+
+	private static Map<String, Object> copyStateMap(Map<?, ?> resultMap) {
+		Map<String, Object> state = new HashMap<>();
+		for (Map.Entry<?, ?> entry : resultMap.entrySet()) {
+			if (!(entry.getKey() instanceof String key)) {
+				throw new IllegalArgumentException("GraphFlux done result map keys must be String");
+			}
+			state.put(key, entry.getValue());
+		}
+		return state;
+	}
+
+	/**
+	 * Checks interruptAfter hook for streaming nodes using the pre-merge state.
+	 * <p>
+	 * This method must be called <strong>before</strong> the streaming state updates are
+	 * merged into the {@link OverAllState} to keep semantics consistent with the
+	 * non-streaming interruptAfter hook.
+	 * @param context the graph runner context
+	 * @param actionResult the streaming node action result (state delta) passed to interruptAfter
+	 * @return interruption metadata if the hook triggers
+	 */
+	private Optional<InterruptionMetadata> interruptAfterForStreaming(GraphRunnerContext context,
+			Map<String, Object> actionResult) {
+		String currentNodeId = context.getCurrentNodeId();
+		AsyncNodeActionWithConfig action = context.getNodeAction(currentNodeId);
+
+		if (!(action instanceof InterruptableAction interruptableAction)) {
+			return Optional.empty();
+		}
+
+		try {
+			OverAllState stateBeforeMerge = context.cloneState(context.getCurrentStateData());
+			return interruptableAction.interruptAfter(currentNodeId, stateBeforeMerge, actionResult,
+					context.getConfig());
+		}
+		catch (Exception e) {
+			context.doListeners(ERROR, e);
+			throw new RuntimeException("Failed to check interruptAfter hook for streaming node", e);
+		}
 	}
 
 	/**
@@ -657,7 +880,8 @@ public class NodeExecutor extends BaseGraphExecutor {
 				String nodeId = graphFlux.getNodeId();
 				Object nodeData = nodeDataRefs.get(nodeId).get();
 
-				combinedResultMap.put(graphFlux.getKey(),nodeData);
+				combinedResultMap = OverAllState.updateState(
+						combinedResultMap, graphFluxResultState(graphFlux, nodeData), context.getKeyStrategyMap());
 			}
 
 			// Merge non-ParallelGraphFlux state
@@ -665,6 +889,11 @@ public class NodeExecutor extends BaseGraphExecutor {
 					.stream()
 					.filter(e -> !(e.getValue() instanceof ParallelGraphFlux))
 					.collect(Collectors.toMap(Map.Entry::getKey, Map.Entry::getValue));
+
+			// Check interruptAfter hook for streaming nodes using the pre-merge state.
+			Map<String, Object> combinedUpdateState = new HashMap<>(partialStateWithoutParallelGraphFlux);
+			combinedUpdateState.putAll(combinedResultMap);
+			Optional<InterruptionMetadata> interruptAfterMetadata = interruptAfterForStreaming(context, combinedUpdateState);
 
 			context.mergeIntoCurrentState(partialStateWithoutParallelGraphFlux);
 
@@ -680,6 +909,7 @@ public class NodeExecutor extends BaseGraphExecutor {
 				context.buildNodeOutputAndAddCheckpoint(partialStateWithoutParallelGraphFlux);
 
 				context.doListeners(NODE_AFTER, null);
+				interruptAfterMetadata.ifPresent(context::setReturnFromEmbedWithValue);
 			} catch (Exception e) {
 				throw new RuntimeException(e);
 			}

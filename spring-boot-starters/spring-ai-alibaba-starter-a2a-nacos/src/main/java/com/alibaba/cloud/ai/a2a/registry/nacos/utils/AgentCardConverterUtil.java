@@ -1,5 +1,5 @@
 /*
- * Copyright 2024-2025 the original author or authors.
+ * Copyright 2024-2026 the original author or authors.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -55,7 +55,8 @@ public class AgentCardConverterUtil {
 			.security(agentCard.getSecurity())
 			.defaultInputModes(agentCard.getDefaultInputModes())
 			.defaultOutputModes(agentCard.getDefaultOutputModes())
-			.supportsAuthenticatedExtendedCard(agentCard.getSupportsAuthenticatedExtendedCard())
+			.supportsAuthenticatedExtendedCard(
+				Boolean.TRUE.equals(agentCard.getSupportsAuthenticatedExtendedCard()))
 			.build();
 	}
 
@@ -141,7 +142,8 @@ public class AgentCardConverterUtil {
 		card.setSecurity(agentCard.security());
 		card.setDefaultInputModes(agentCard.defaultInputModes());
 		card.setDefaultOutputModes(agentCard.defaultOutputModes());
-		card.setSupportsAuthenticatedExtendedCard(agentCard.supportsAuthenticatedExtendedCard());
+		card.setSupportsAuthenticatedExtendedCard(
+				Boolean.TRUE.equals(agentCard.supportsAuthenticatedExtendedCard()));
 		return card;
 	}
 
