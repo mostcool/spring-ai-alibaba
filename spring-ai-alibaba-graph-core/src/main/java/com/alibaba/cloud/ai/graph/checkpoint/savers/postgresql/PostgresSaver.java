@@ -28,6 +28,8 @@ import java.sql.SQLException;
 import java.sql.Statement;
 import java.sql.Types;
 import java.util.Base64;
+import java.util.Collection;
+import java.util.Collections;
 import java.util.LinkedList;
 import java.util.Map;
 import java.util.NoSuchElementException;
@@ -62,6 +64,7 @@ import static java.util.Objects.requireNonNull;
  *          ON GraphThread(thread_name) WHERE is_released = FALSE
  *
  *     CREATE TABLE GraphCheckpoint (
+ *          checkpoint_seq BIGSERIAL UNIQUE,
  *          checkpoint_id UUID PRIMARY KEY,
  *          parent_checkpoint_id UUID,
  *          thread_id UUID NOT NULL,
@@ -117,6 +120,7 @@ public class PostgresSaver extends AbstractJdbcCheckpointSaver {
 			 );
 
 			 CREATE TABLE IF NOT EXISTS GraphCheckpoint (
+			     checkpoint_seq BIGSERIAL UNIQUE,
 			     checkpoint_id UUID PRIMARY KEY,
 			     parent_checkpoint_id UUID,
 			     thread_id UUID NOT NULL,
@@ -135,8 +139,20 @@ public class PostgresSaver extends AbstractJdbcCheckpointSaver {
 
 	private static final String CREATE_INDEXES = """
 			CREATE INDEX IF NOT EXISTS idx_lg4jcheckpoint_thread_id ON GraphCheckpoint(thread_id);
-			CREATE INDEX IF NOT EXISTS idx_lg4jcheckpoint_thread_id_saved_at_desc ON GraphCheckpoint(thread_id, saved_at DESC);
+			CREATE INDEX IF NOT EXISTS idx_lg4jcheckpoint_thread_id_sequence ON GraphCheckpoint(thread_id, checkpoint_seq DESC);
 			CREATE UNIQUE INDEX IF NOT EXISTS idx_unique_lg4jthread_thread_name_unreleased ON GraphThread(thread_name) WHERE is_released = FALSE;
+			""";
+
+	private static final String ADD_CHECKPOINT_SEQUENCE_COLUMN = """
+			ALTER TABLE GraphCheckpoint
+			ADD COLUMN checkpoint_seq BIGSERIAL UNIQUE
+			""";
+
+	private static final String HAS_CHECKPOINT_SEQUENCE_COLUMN = """
+			SELECT 1
+			FROM information_schema.columns
+			WHERE table_name = 'graphcheckpoint'
+			  AND column_name = 'checkpoint_seq'
 			""";
 
 	// DML statements
@@ -192,7 +208,7 @@ public class PostgresSaver extends AbstractJdbcCheckpointSaver {
 			FROM GraphCheckpoint c
 			  JOIN GraphThread t ON c.thread_id = t.thread_id
 			WHERE t.thread_name = ? AND t.is_released = FALSE
-			ORDER BY c.saved_at DESC
+			ORDER BY c.checkpoint_seq DESC
 			""";
 
 	private static final String SELECT_LATEST_CHECKPOINT = """
@@ -205,7 +221,7 @@ public class PostgresSaver extends AbstractJdbcCheckpointSaver {
 			FROM GraphCheckpoint c
 			  JOIN GraphThread t ON c.thread_id = t.thread_id
 			WHERE t.thread_name = ? AND t.is_released = FALSE
-			ORDER BY c.saved_at DESC
+			ORDER BY c.checkpoint_seq DESC
 			LIMIT 1
 			""";
 
@@ -226,6 +242,14 @@ public class PostgresSaver extends AbstractJdbcCheckpointSaver {
 			UPDATE GraphThread
 			SET is_released = TRUE
 			WHERE thread_name = ? AND is_released = FALSE
+			""";
+
+	private static final String DELETE_CHECKPOINTS = """
+			DELETE FROM GraphCheckpoint c
+			USING GraphThread t
+			WHERE c.thread_id = t.thread_id
+			  AND t.thread_name = ? AND t.is_released = FALSE
+			  AND c.checkpoint_id IN (%s)
 			""";
 
 	/**
@@ -328,6 +352,10 @@ public class PostgresSaver extends AbstractJdbcCheckpointSaver {
 				sqlCommand = CREATE_TABLES;
 				statement.executeUpdate(sqlCommand);
 
+				log.trace("Ensuring checkpoint sequence column exists");
+				sqlCommand = ADD_CHECKPOINT_SEQUENCE_COLUMN;
+				ensureCheckpointSequenceColumn(connection);
+
 				log.trace("Executing create indexes:\n---\n{}---", CREATE_INDEXES);
 				sqlCommand = CREATE_INDEXES;
 				statement.executeUpdate(sqlCommand);
@@ -336,6 +364,19 @@ public class PostgresSaver extends AbstractJdbcCheckpointSaver {
 		catch (SQLException ex) {
 			log.error("error executing command\n{}\n", sqlCommand, ex);
 			throw ex;
+		}
+	}
+
+	private void ensureCheckpointSequenceColumn(Connection connection) throws SQLException {
+		try (Statement statement = connection.createStatement();
+				ResultSet resultSet = statement.executeQuery(HAS_CHECKPOINT_SEQUENCE_COLUMN)) {
+			if (resultSet.next()) {
+				return;
+			}
+		}
+
+		try (Statement statement = connection.createStatement()) {
+			statement.execute(ADD_CHECKPOINT_SEQUENCE_COLUMN);
 		}
 	}
 
@@ -507,6 +548,26 @@ public class PostgresSaver extends AbstractJdbcCheckpointSaver {
 			log.error("Error updating checkpoint with id {} in thread {}", checkpoint.getId(), threadId, ex);
 			rollback(conn, checkpoint, threadId);
 			throw new Exception("Unable to update checkpoint", ex);
+		}
+	}
+
+	@Override
+	protected void deleteCheckpoints(String threadId, Collection<String> checkpointIds) throws Exception {
+		if (checkpointIds.isEmpty()) {
+			return;
+		}
+		try (Connection conn = getConnection();
+				PreparedStatement ps = conn.prepareStatement(
+						DELETE_CHECKPOINTS.formatted(String.join(", ", Collections.nCopies(checkpointIds.size(), "?"))))) {
+			ps.setString(1, threadId);
+			int index = 2;
+			for (String checkpointId : checkpointIds) {
+				ps.setObject(index++, UUID.fromString(checkpointId), Types.OTHER);
+			}
+			ps.executeUpdate();
+		}
+		catch (SQLException ex) {
+			throw new Exception("Unable to delete retained checkpoints", ex);
 		}
 	}
 
